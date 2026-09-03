@@ -6,6 +6,8 @@
 #include <thread>
 #include <mutex>
 
+#include "helpers.h"
+
 using namespace std;
 
 #define SERVER_PORT 5000
@@ -13,39 +15,20 @@ using namespace std;
 mutex cout_mutex;
 mutex users_mutex;
 
-// Data structures
-
-// username -> IP address
 map<string, string> registered_users;
-
-// username -> socket file descriptor
 map<string, int> client_sockets;
+map<string, string> chat_partner;
 
-// username -> currently selected chatting partner
-map<string, string> chatting_with;
-
-// Send a string to a client
-bool send_message(int client_fd, const string &message)
-{
-    return send(
-               client_fd,
-               message.c_str(),
-               message.length(),
-               0) >= 0;
+bool send_message(int client_fd, const string &message){
+    return send_plain(client_fd, message);
 }
 
-// Handles communication with one client
-
-void handle_client(int client_fd, string client_ip)
-{
+void handle_client(int client_fd, string client_ip){
     char buffer[1024];
 
-    // 1. Ask client to register
-    string welcome =
-        "Hello from server. Please register.\n";
+    string welcome = "Hello from server. Please register.\n";
 
-    if (!send_message(client_fd, welcome))
-    {
+    if (!send_message(client_fd, welcome)){
         perror("Send failed");
         close(client_fd);
         return;
@@ -54,48 +37,29 @@ void handle_client(int client_fd, string client_ip)
     string username = "";
     bool registered = false;
 
-    // 2. Wait for registration
-    while (!registered)
-    {
+    // Wait for registration
+    while (!registered){
         memset(buffer, 0, sizeof(buffer));
 
-        int bytes_received = recv(
-            client_fd,
-            buffer,
-            sizeof(buffer) - 1,
-            0);
+        int bytes_received = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
 
-        if (bytes_received < 0)
-        {
+        if (bytes_received < 0){
             perror("Receive failed");
             close(client_fd);
             return;
         }
 
-        if (bytes_received == 0)
-        {
+        if (bytes_received == 0){
             lock_guard<mutex> lock(cout_mutex);
-
-            cout << "Client disconnected before registration: "
-                 << client_ip << endl;
-
+            cout << "Client disconnected before registration: " << client_ip << endl;
             close(client_fd);
             return;
         }
 
         buffer[bytes_received] = '\0';
-
         string message(buffer);
+        message = trim_message(message);
 
-        // Remove trailing newline / carriage return
-        while (!message.empty() &&
-               (message.back() == '\n' ||
-                message.back() == '\r'))
-        {
-            message.pop_back();
-        }
-
-        // 3. Check registration format
         const string prefix = "#register ";
 
         if (message.rfind(prefix, 0) != 0)
@@ -105,14 +69,11 @@ void handle_client(int client_fd, string client_ip)
                 "#register <username>\n";
 
             send_message(client_fd, reply);
-
             continue;
         }
 
-        // Extract username
         username = message.substr(prefix.length());
 
-        // Check empty username
         if (username.empty())
         {
             string reply =
@@ -124,7 +85,7 @@ void handle_client(int client_fd, string client_ip)
             continue;
         }
 
-        // 4. Check if username is already taken
+        // Check if username is already taken
         {
             lock_guard<mutex> lock(users_mutex);
 
@@ -139,12 +100,9 @@ void handle_client(int client_fd, string client_ip)
                 continue;
             }
 
-            // 5. Register user
             registered_users[username] = client_ip;
             client_sockets[username] = client_fd;
-
-            // Initially no chat partner selected
-            chatting_with[username] = "";
+            chat_partner[username] = "";
 
             registered = true;
         }
@@ -157,62 +115,43 @@ void handle_client(int client_fd, string client_ip)
 
         {
             lock_guard<mutex> lock(cout_mutex);
-
-            cout << "User registered: "
-                 << username
-                 << " -> "
-                 << client_ip
-                 << endl;
+            cout << "User registered: " << username << " -> " << client_ip << endl;
         }
     }
 
-    // 7. Normal communication
     while (true)
     {
         memset(buffer, 0, sizeof(buffer));
 
-        int bytes_received = recv(
-            client_fd,
-            buffer,
-            sizeof(buffer) - 1,
-            0);
+        int bytes_received = recv( client_fd, buffer, sizeof(buffer) - 1, 0);
 
-        if (bytes_received < 0)
-        {
+        if (bytes_received < 0){
             perror("Receive failed");
             break;
         }
 
-        // --------------------------------------------------
-        // Client disconnected
-        // --------------------------------------------------
-
-        if (bytes_received == 0)
-        {
+        if (bytes_received == 0){
             lock_guard<mutex> lock(cout_mutex);
 
-            cout << "Client disconnected: "
-                 << username
-                 << " (" << client_ip << ")"
-                 << endl;
+            cout << "Client disconnected: " << username
+                 << " (" << client_ip << ")" << endl;
 
             break;
         }
 
         buffer[bytes_received] = '\0';
-
         string message(buffer);
+        message = trim_message(message);
 
-        // Remove trailing newline / carriage return
-        while (!message.empty() &&
-               (message.back() == '\n' ||
-                message.back() == '\r'))
+        if (message == "#register" ||
+            message.rfind("#register ", 0) == 0)
         {
-            message.pop_back();
+            send_message(client_fd,
+                         "You are already registered as " + username + ".\n");
+            continue;
         }
 
         // @username message
-
         if (!message.empty() &&
             message[0] == '@')
         {
@@ -244,22 +183,17 @@ void handle_client(int client_fd, string client_ip)
                 if (target_fd == -1)
                 {
                     string reply =
-                        "User " +
-                        target_username +
-                        " is not online.\n";
+                        "User " + target_username + " is not online.\n";
 
                     send_message(client_fd, reply);
 
                     continue;
                 }
 
-                // Send message to target
                 string forwarded_message =
                     "You received this from client " +
-                    username +
-                    ": " +
-                    actual_message +
-                    "\n";
+                    username + ": " +
+                    actual_message + "\n";
 
                 send_message(
                     target_fd,
@@ -276,13 +210,13 @@ void handle_client(int client_fd, string client_ip)
                          << endl;
                 }
 
-                chatting_with[username] = target_username;
+                chat_partner[username] = target_username;
 
                 continue;
             }
         }
 
-        // /chat sreeja
+        // /chat username
 
         if (message.rfind("/chat ", 0) == 0)
         {
@@ -301,8 +235,7 @@ void handle_client(int client_fd, string client_ip)
 
                 if (user_exists)
                 {
-                    chatting_with[username] =
-                        target_username;
+                    chat_partner[username] = target_username;
                 }
             }
 
@@ -320,7 +253,6 @@ void handle_client(int client_fd, string client_ip)
         }
 
         // /who
-
         if (message == "/who")
         {
             string reply = "Online users:\n";
@@ -343,11 +275,6 @@ void handle_client(int client_fd, string client_ip)
 
         if (message == "/quit")
         {
-            string reply =
-                "Goodbye!\n";
-
-            send_message(client_fd, reply);
-
             break;
         }
 
@@ -357,7 +284,7 @@ void handle_client(int client_fd, string client_ip)
             lock_guard<mutex> lock(users_mutex);
 
             target_username =
-                chatting_with[username];
+                chat_partner[username];
         }
 
         // No chatting partner selected
@@ -365,14 +292,13 @@ void handle_client(int client_fd, string client_ip)
         {
             string reply =
                 "No chatting partner selected. "
-                "Use /chat <username> first.\n";
+                "Use /chat <username> to select one.\n";
 
             send_message(client_fd, reply);
 
             continue;
         }
 
-        // Find target socket
         int target_fd = -1;
 
         {
@@ -431,10 +357,10 @@ void handle_client(int client_fd, string client_ip)
         // Remove this user
         registered_users.erase(username);
         client_sockets.erase(username);
-        chatting_with.erase(username);
+        chat_partner.erase(username);
 
         // Remove this user as a chat partner
-        for (auto &entry : chatting_with)
+        for (auto &entry : chat_partner)
         {
             if (entry.second == username)
             {
@@ -449,12 +375,7 @@ void handle_client(int client_fd, string client_ip)
 
 int main()
 {
- 
-
-    int server_fd = socket(
-        AF_INET,
-        SOCK_STREAM,
-        0);
+    int server_fd = socket(AF_INET, SOCK_STREAM,0);
 
     if (server_fd < 0)
     {
@@ -465,26 +386,18 @@ int main()
     // Allow reuse of port
     int opt = 1;
 
-    if (setsockopt(
-            server_fd,
-            SOL_SOCKET,
-            SO_REUSEADDR,
-            &opt,
-            sizeof(opt)) < 0)
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0)
     {
         perror("setsockopt failed");
         close(server_fd);
         return 1;
     }
 
-
     sockaddr_in server_addr{};
 
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(SERVER_PORT);
     server_addr.sin_addr.s_addr = INADDR_ANY;
-
-
 
     if (bind(
             server_fd,
@@ -496,9 +409,7 @@ int main()
         return 1;
     }
 
-    cout << "Server bound to port "
-         << SERVER_PORT << endl;
-
+    cout << "Server bound to port " << SERVER_PORT << endl;
 
     if (listen(server_fd, 2) < 0)
     {

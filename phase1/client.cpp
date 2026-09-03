@@ -6,12 +6,13 @@
 #include <thread>
 #include <mutex>
 
+#include "helpers.h"
+
 using namespace std;
 
 #define SERVER_PORT 5000
 mutex cout_mutex;
 
-// Continuously receive messages from server
 void receive_messages(int sock_fd)
 {
     char buffer[1024];
@@ -37,8 +38,6 @@ void receive_messages(int sock_fd)
                 perror("Receive failed");
 
             cout << "Exiting client...\n";
-
-            // Automatically terminate entire client program
             exit(0);
         }
 
@@ -54,7 +53,6 @@ void receive_messages(int sock_fd)
     }
 }
 
-// MAIN
 int main()
 {
     string server_ip;
@@ -62,6 +60,12 @@ int main()
     cout << "Enter server IP: ";
     cin >> server_ip;
     cin.ignore(numeric_limits<streamsize>::max(), '\n');
+
+    int port = DEFAULT_PORT;
+    cout << "Enter server port : ";
+    string port_input;
+    getline(cin, port_input);
+    if (!port_input.empty()) port = stoi(port_input);
 
     // 1. Create TCP socket
     int sock_fd = socket(
@@ -80,7 +84,7 @@ int main()
     sockaddr_in server_addr{};
 
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(SERVER_PORT);
+    server_addr.sin_port = htons(port);
 
     if (inet_pton(
             AF_INET,
@@ -88,9 +92,7 @@ int main()
             &server_addr.sin_addr) <= 0)
     {
         cerr << "Invalid server IP address\n";
-
         close(sock_fd);
-
         return 1;
     }
 
@@ -108,7 +110,7 @@ int main()
     cout << "\nConnected to server "
          << server_ip
          << ":"
-         << SERVER_PORT
+         << port
          << endl;
 
     // 4. Start receiver thread
@@ -131,21 +133,12 @@ int main()
             break;
         }
 
-        // Ignore empty messages
         if (message.empty())
         {
             continue;
         }
 
-        // Send message to server
-        int result = send(
-            sock_fd,
-            message.c_str(),
-            message.length(),
-            0
-        );
-
-        if (result < 0)
+        if (!send_plain(sock_fd, message))
         {
             perror("Send failed");
             break;
@@ -158,7 +151,6 @@ int main()
         }
     }
 
-    // 6. Close socket
     shutdown(sock_fd, SHUT_RDWR);
     close(sock_fd);
 

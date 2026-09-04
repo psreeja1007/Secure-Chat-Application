@@ -1,4 +1,6 @@
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -30,11 +32,19 @@ atomic<bool> quitting{false};
 struct E2ESession {
     aesgcm::Key key{};
     bool established = false;
+    uint64_t timestamp = 0;
+    uint64_t pending_timestamp = 0;
+    string pending_peer_public;
     dh::KeyPair pending_keypair;
     vector<string> pending_messages;
 };
 
 map<string, E2ESession> e2e_sessions;
+
+static uint64_t current_timestamp() {
+    return static_cast<uint64_t>(chrono::duration_cast<chrono::seconds>(
+        chrono::system_clock::now().time_since_epoch()).count());
+}
 
 static bool send_client_message(int sock_fd, const aesgcm::Key &key, const string &message) {
     lock_guard<mutex> lock(send_mutex);
@@ -56,15 +66,29 @@ static bool establish_e2e_session(int sock_fd, const aesgcm::Key &server_key,
     if (!ctx) return false;
     try {
         session.pending_keypair = dh::generate_keypair(ctx);
+        session.pending_timestamp = current_timestamp();
+        session.pending_peer_public.clear();
         string public_hex = dh::bn_to_hex(session.pending_keypair.pub);
         BN_CTX_free(ctx);
-        return send_to_peer(sock_fd, server_key, peer, "__E2E_INIT__" + public_hex);
+        return send_to_peer(sock_fd, server_key, peer,
+                            "__E2E_INIT__" + to_string(session.pending_timestamp) + "|" + public_hex);
     } catch (const exception &e) {
         cerr << "E2E DH initialization error: " << e.what() << endl;
         dh::free_keypair(session.pending_keypair);
         BN_CTX_free(ctx);
         return false;
     }
+}
+
+static void reset_e2e_session(const string &peer) {
+    lock_guard<mutex> lock(e2e_mutex);
+    E2ESession &session = e2e_sessions[peer];
+    session.key = aesgcm::Key{};
+    session.established = false;
+    session.timestamp = 0;
+    session.pending_timestamp = 0;
+    session.pending_peer_public.clear();
+    dh::free_keypair(session.pending_keypair);
 }
 
 static bool handle_e2e_control(int sock_fd, const aesgcm::Key &server_key,
@@ -110,33 +134,101 @@ static bool handle_e2e_control(int sock_fd, const aesgcm::Key &server_key,
         return true;
     }
 
+    uint64_t exchange_timestamp = 0;
+    string public_hex = data;
+    if (prefix == "__E2E_INIT__" || prefix == "__E2E_ACK__") {
+        size_t data_separator = data.find('|');
+        if (data_separator == string::npos || data_separator == 0 ||
+            data_separator == data.size() - 1) return true;
+        try {
+            exchange_timestamp = stoull(data.substr(0, data_separator));
+        } catch (const exception &) {
+            return true;
+        }
+        public_hex = data.substr(data_separator + 1);
+    }
+
     BIGNUM *peer_public = nullptr;
-    if (data.empty() || !dh::hex_to_bn(&peer_public, data)) return true;
+    if (public_hex.empty() || !dh::hex_to_bn(&peer_public, public_hex)) return true;
     BN_CTX *ctx = BN_CTX_new();
     if (!ctx) { BN_free(peer_public); return true; }
 
     bool send_ack = prefix == "__E2E_INIT__";
     string ack_public;
+    uint64_t ack_timestamp = 0;
     vector<string> queued;
+    bool accepted = false;
+    bool keep_existing_key = false;
     {
         lock_guard<mutex> lock(e2e_mutex);
         E2ESession &session = e2e_sessions[peer];
-        if (!session.pending_keypair.pub) {
-            dh::free_keypair(session.pending_keypair);
-            session.pending_keypair = dh::generate_keypair(ctx);
+
+        if (!accepted && send_ack) {
+            bool same_exchange = session.pending_keypair.pub &&
+                session.pending_timestamp == exchange_timestamp &&
+                session.pending_peer_public == public_hex;
+            bool local_wins = session.pending_keypair.pub &&
+                !session.established &&
+                (session.pending_timestamp < exchange_timestamp ||
+                 (session.pending_timestamp == exchange_timestamp &&
+                  dh::bn_to_hex(session.pending_keypair.pub) < public_hex));
+
+            if (session.established && same_exchange) {
+                ack_timestamp = session.timestamp;
+                ack_public = dh::bn_to_hex(session.pending_keypair.pub);
+                accepted = true;
+                keep_existing_key = true;
+            } else if (local_wins) {
+                BN_free(peer_public);
+                BN_CTX_free(ctx);
+                return true;
+            } else {
+                dh::free_keypair(session.pending_keypair);
+                session.pending_keypair = dh::generate_keypair(ctx);
+                session.pending_timestamp = exchange_timestamp;
+                session.pending_peer_public = public_hex;
+                ack_public = dh::bn_to_hex(session.pending_keypair.pub);
+                ack_timestamp = exchange_timestamp;
+                accepted = true;
+            }
+        } else if (!accepted) {
+            if (!session.pending_keypair.pub || session.pending_timestamp != exchange_timestamp) {
+                BN_free(peer_public);
+                BN_CTX_free(ctx);
+                return true;
+            }
+            accepted = true;
         }
-        BIGNUM *shared = dh::compute_shared_secret(session.pending_keypair, peer_public, ctx);
-        session.key = dh::derive_aes_key(shared);
-        session.established = true;
-        queued.swap(session.pending_messages);
-        if (send_ack) ack_public = dh::bn_to_hex(session.pending_keypair.pub);
-        BN_clear_free(shared);
-        if (!send_ack) dh::free_keypair(session.pending_keypair);
+
+        if (!keep_existing_key) {
+            BIGNUM *shared = dh::compute_shared_secret(session.pending_keypair, peer_public, ctx);
+            session.key = dh::derive_aes_key(shared);
+            session.established = true;
+            session.timestamp = exchange_timestamp;
+            queued.swap(session.pending_messages);
+            BN_clear_free(shared);
+        }
     }
     BN_free(peer_public);
     BN_CTX_free(ctx);
 
-    if (send_ack && !send_to_peer(sock_fd, server_key, peer, "__E2E_ACK__" + ack_public))
+    aesgcm::Key established_key{};
+    uint64_t established_timestamp = 0;
+    {
+        lock_guard<mutex> lock(e2e_mutex);
+        established_key = e2e_sessions[peer].key;
+        established_timestamp = e2e_sessions[peer].timestamp;
+    }
+    {
+        lock_guard<mutex> output_lock(cout_mutex);
+        cout << "[E2E] Key with client " << peer
+             << " | fingerprint: " << dh::fingerprint_hex(established_key)
+             << " | timestamp: " << established_timestamp << endl;
+    }
+
+    if (send_ack && !send_to_peer(sock_fd, server_key, peer,
+                                  "__E2E_ACK__" + to_string(
+                                      ack_timestamp ? ack_timestamp : exchange_timestamp) + "|" + ack_public))
         return true;
 
     for (const string &pending : queued) {
@@ -370,6 +462,28 @@ int main() {
                 perror("Send failed");
                 break;
             }
+            continue;
+        }
+
+        if (message.rfind("/e2e ", 0) == 0) {
+            string e2e_peer = message.substr(5);
+            if (e2e_peer.empty()) {
+                lock_guard<mutex> output_lock(cout_mutex);
+                cout << "Error: use /e2e <username>.\n";
+                continue;
+            }
+
+            active_peer = e2e_peer;
+            reset_e2e_session(e2e_peer);
+            if (!establish_e2e_session(sock_fd, key, e2e_peer)) {
+                lock_guard<mutex> output_lock(cout_mutex);
+                cout << "Error: could not start the E2E handshake with client "
+                     << e2e_peer << ".\n";
+                continue;
+            }
+
+            lock_guard<mutex> output_lock(cout_mutex);
+            cout << "[E2E] Handshake requested with client " << e2e_peer << ".\n";
             continue;
         }
 

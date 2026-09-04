@@ -20,7 +20,6 @@
 
 using namespace std;
 
-constexpr int DEFAULT_PORT = 5000;
 constexpr int SERVER_PORT = 5000;
 
 mutex cout_mutex;
@@ -315,8 +314,8 @@ int main() {
     cin >> server_ip;
     cin.ignore(numeric_limits<streamsize>::max(), '\n');
 
-    int port = DEFAULT_PORT;
-    cout << "Enter server port [5000]: ";
+    int port = SERVER_PORT;
+    cout << "Enter server port : ";
     string port_input;
     getline(cin, port_input);
     if (!port_input.empty()) port = stoi(port_input);

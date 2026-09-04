@@ -4,7 +4,6 @@
 #include <mutex>
 #include <string>
 #include <thread>
-#include <vector>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -12,10 +11,8 @@
 #include <unistd.h>
 
 #include <openssl/bn.h>
-#include <openssl/x509.h>
 
 #include "helpers.h"
-#include "pki_utils.h"
 
 using namespace std;
 
@@ -25,111 +22,82 @@ mutex cout_mutex;
 atomic<bool> quitting{false};
 
 static bool perform_dh_client(int sock_fd, aesgcm::Key &key_out) {
-    constexpr const char *CA_CERT = "certs/ca.crt";
-    constexpr const char *EXPECTED_SERVER_NAME = "Chat Server";
-
-    cout << "[PKI] Waiting for server certificate...\n";
-    string cert_pem;
-    if (!pki::recv_blob(sock_fd, cert_pem)) {
-        cerr << "[PKI] Failed to receive certificate.\n";
+    string server_handshake_line;
+    if (!recv_plain_line(sock_fd, server_handshake_line)) {
+        cout << "Server disconnected during DH handshake." << endl;
         return false;
     }
 
-    BIO *bio = BIO_new_mem_buf(cert_pem.data(), static_cast<int>(cert_pem.size()));
-    if (!bio) return false;
-    X509 *server_cert = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
-    BIO_free(bio);
-    if (!server_cert) {
-        cerr << "[PKI] Invalid certificate received.\n";
+    if (server_handshake_line.rfind("DH_INIT ", 0) != 0) {
+        cout << "Unexpected DH init message: " << server_handshake_line << endl;
         return false;
     }
 
-    cout << "[PKI] Validating certificate...\n";
-    if (!pki::verify_certificate(server_cert, CA_CERT, EXPECTED_SERVER_NAME)) {
-        cerr << "[SECURITY] Server certificate rejected. Connection aborted.\n";
-        X509_free(server_cert);
-        return false;
-    }
-    cout << "[PKI] Certificate is valid.\n";
-    cout << "[PKI] Trusted CA: YES\n";
-    cout << "[PKI] Validity period: OK\n";
-    cout << "[PKI] Server identity: OK\n";
-
-    string challenge;
-    if (!pki::generate_challenge(challenge)) {
-        X509_free(server_cert);
-        return false;
-    }
-    if (!send_plain(sock_fd, "AUTH_CHALLENGE " + challenge + "\n")) {
-        X509_free(server_cert);
+    string server_public_key_hex = server_handshake_line.substr(8);
+    if (server_public_key_hex.empty()) {
+        cout << "Malformed DH init message." << endl;
         return false;
     }
 
-    string dh_init;
-    if (!recv_plain_line(sock_fd, dh_init) || dh_init.rfind("DH_INIT ", 0) != 0) {
-        cerr << "[PKI] Expected DH_INIT.\n";
-        X509_free(server_cert);
-        return false;
-    }
-    string server_public_key_hex = dh_init.substr(8);
-
-    string sig_line;
-    if (!recv_plain_line(sock_fd, sig_line) || sig_line.rfind("DH_SIGNATURE ", 0) != 0) {
-        cerr << "[PKI] Expected DH signature.\n";
-        X509_free(server_cert);
-        return false;
-    }
-    vector<unsigned char> signature;
-    if (!pki::from_hex(sig_line.substr(13), signature)) {
-        cerr << "[PKI] Invalid signature format.\n";
-        X509_free(server_cert);
+    BN_CTX *bignum_context = BN_CTX_new();
+    if (!bignum_context) {
+        perror("BN_CTX_new failed");
         return false;
     }
 
-    string signed_data = "CHAT-DH-PROOF|" + challenge + "|" + server_public_key_hex;
-    cout << "[PKI] Verifying server private-key proof...\n";
-    if (!pki::verify_signature(server_cert, signed_data, signature)) {
-        cerr << "[SECURITY] Server proof-of-possession FAILED.\n";
-        cerr << "[SECURITY] Connection aborted.\n";
-        X509_free(server_cert);
-        return false;
-    }
-    cout << "[PKI] Server proof-of-possession: VALID\n";
-    X509_free(server_cert);
-
-    BN_CTX *ctx = BN_CTX_new();
-    if (!ctx) return false;
     try {
-        dh::KeyPair key_pair = dh::generate_keypair(ctx);
+        dh::KeyPair key_pair = dh::generate_keypair(bignum_context);
+
         BIGNUM *server_public_key = nullptr;
         if (!dh::hex_to_bn(&server_public_key, server_public_key_hex)) {
-            dh::free_keypair(key_pair); BN_CTX_free(ctx); return false;
+            cout << "Failed to parse server DH public value." << endl;
+            dh::free_keypair(key_pair);
+            BN_CTX_free(bignum_context);
+            return false;
         }
 
         string client_reply = "DH_RESP " + dh::bn_to_hex(key_pair.pub) + "\n";
         if (!send_plain(sock_fd, client_reply)) {
-            BN_free(server_public_key); dh::free_keypair(key_pair); BN_CTX_free(ctx); return false;
+            perror("DH response send failed");
+            BN_free(server_public_key);
+            dh::free_keypair(key_pair);
+            BN_CTX_free(bignum_context);
+            return false;
         }
 
         string server_ack;
-        if (!recv_plain_line(sock_fd, server_ack) || server_ack != "DH_OK") {
-            cerr << "Unexpected DH completion response.\n";
-            BN_free(server_public_key); dh::free_keypair(key_pair); BN_CTX_free(ctx); return false;
+        if (!recv_plain_line(sock_fd, server_ack)) {
+            cout << "Server disconnected before DH completion." << endl;
+            BN_free(server_public_key);
+            dh::free_keypair(key_pair);
+            BN_CTX_free(bignum_context);
+            return false;
+        }
+        if (server_ack != "DH_OK") {
+            cout << "Unexpected DH completion response: " << server_ack << endl;
+            BN_free(server_public_key);
+            dh::free_keypair(key_pair);
+            BN_CTX_free(bignum_context);
+            return false;
         }
 
-        BIGNUM *shared_secret = dh::compute_shared_secret(key_pair, server_public_key, ctx);
+        BIGNUM *shared_secret = dh::compute_shared_secret(key_pair, server_public_key, bignum_context);
         key_out = dh::derive_aes_key(shared_secret);
-        cout << "[DH] Shared key established with server | fingerprint: "
-             << dh::fingerprint_hex(key_out) << endl;
+
+        {
+            lock_guard<mutex> lock(cout_mutex);
+            cout << "[DH] Shared key established with server | fingerprint: "
+                 << dh::fingerprint_hex(key_out) << endl;
+        }
 
         BN_free(server_public_key);
         BN_clear_free(shared_secret);
         dh::free_keypair(key_pair);
-        BN_CTX_free(ctx);
+        BN_CTX_free(bignum_context);
         return true;
-    } catch (const exception &e) {
+    } catch (const std::exception &e) {
         cerr << "DH handshake error: " << e.what() << endl;
-        BN_CTX_free(ctx);
+        BN_CTX_free(bignum_context);
         return false;
     }
 }
@@ -205,7 +173,7 @@ int main() {
         return 1;
     }
 
-    cout << "\nConnected to server " << server_ip << ":" << SERVER_PORT << endl;
+    cout << "\nConnected to server " << server_ip << ":" << port << endl;
     cout << "All further traffic on this link is AES-256-GCM encrypted.\n";
 
     thread receiver(receive_messages, sock_fd, key);

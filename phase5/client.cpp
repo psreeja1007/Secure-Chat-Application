@@ -22,7 +22,6 @@
 
 using namespace std;
 
-constexpr int DEFAULT_PORT = 5000;
 constexpr int SERVER_PORT = 5000;
 
 mutex cout_mutex;
@@ -175,8 +174,7 @@ static bool handle_e2e_control(int sock_fd, const aesgcm::Key &server_key,
             accepted = true;
         }
 
-        if (accepted) {
-        } else if (send_ack) {
+        if (!accepted && send_ack) {
             bool local_wins = session.pending_keypair.pub &&
                 (session.pending_timestamp < exchange_timestamp ||
                  (session.pending_timestamp == exchange_timestamp &&
@@ -198,7 +196,7 @@ static bool handle_e2e_control(int sock_fd, const aesgcm::Key &server_key,
             session.pending_timestamp = exchange_timestamp;
             ack_public = dh::bn_to_hex(session.pending_keypair.pub);
             accepted = true;
-        } else {
+        } else if (!accepted) {
             if (!session.pending_keypair.pub || session.pending_timestamp != exchange_timestamp) {
                 BN_free(peer_public);
                 BN_CTX_free(ctx);
@@ -416,8 +414,8 @@ int main() {
     cin >> server_ip;
     cin.ignore(numeric_limits<streamsize>::max(), '\n');
 
-    int port = DEFAULT_PORT;
-    cout << "Enter server port [5000]: ";
+    int port = SERVER_PORT;
+    cout << "Enter server port : ";
     string port_input;
     getline(cin, port_input);
     if (!port_input.empty()) port = stoi(port_input);
